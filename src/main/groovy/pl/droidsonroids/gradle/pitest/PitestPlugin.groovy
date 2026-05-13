@@ -16,15 +16,14 @@
 package pl.droidsonroids.gradle.pitest
 
 import com.android.build.api.dsl.AndroidSourceSet
-import com.android.build.gradle.AppPlugin
-import com.android.build.gradle.BaseExtension
-import com.android.build.gradle.DynamicFeaturePlugin
-import com.android.build.gradle.LibraryPlugin
-import com.android.build.gradle.TestPlugin
-import com.android.build.gradle.api.BaseVariant
-import com.android.build.gradle.internal.api.TestedVariant
-import com.android.builder.model.AndroidProject
-import com.vdurmont.semver4j.Semver
+import com.android.build.api.dsl.CommonExtension
+import com.android.build.api.variant.AndroidComponentsExtension
+import com.android.build.api.variant.ApplicationAndroidComponentsExtension
+import com.android.build.api.variant.DynamicFeatureAndroidComponentsExtension
+import com.android.build.api.variant.HasUnitTest
+import com.android.build.api.variant.LibraryAndroidComponentsExtension
+import com.android.build.api.variant.TestAndroidComponentsExtension
+import com.android.build.api.variant.Variant
 import groovy.transform.CompileDynamic
 import groovy.transform.PackageScope
 import org.gradle.api.Action
@@ -39,22 +38,27 @@ import org.gradle.api.artifacts.result.ResolvedComponentResult
 import org.gradle.api.attributes.Attribute
 import org.gradle.api.file.Directory
 import org.gradle.api.file.FileCollection
-import org.gradle.api.internal.DefaultDomainObjectSet
 import org.gradle.api.logging.Logger
 import org.gradle.api.logging.Logging
 import org.gradle.api.plugins.BasePlugin
 import org.gradle.api.provider.Provider
 import org.gradle.api.reporting.ReportingExtension
+import org.gradle.api.tasks.TaskProvider
 import org.gradle.api.tasks.compile.JavaCompile
 import org.gradle.util.GradleVersion
 
 import java.util.concurrent.Callable
 
-import static com.android.builder.model.Version.ANDROID_GRADLE_PLUGIN_VERSION
 import static org.gradle.language.base.plugins.LifecycleBasePlugin.VERIFICATION_GROUP
 
 /**
  * The main class for Pitest plugin.
+ *
+ * AGP 9.x migration: variant iteration uses `AndroidComponentsExtension.onVariants` callbacks
+ * instead of the removed `project.android.libraryVariants`/`applicationVariants`/`testVariants`
+ * properties. BaseExtension references replaced with CommonExtension. The mockable-android-jar
+ * task receives sdkDirectory/compileSdkVersion/returnDefaultValues as injected inputs because
+ * `project.android.sdkDirectory` moved to `androidComponents.sdkComponents.sdkDirectory` in AGP 9.0.
  */
 @CompileDynamic
 class PitestPlugin implements Plugin<Project> {
@@ -72,7 +76,6 @@ class PitestPlugin implements Plugin<Project> {
 
     @SuppressWarnings("FieldName")
     private final static Logger log = Logging.getLogger(PitestPlugin)
-    private final static Semver ANDROID_GRADLE_PLUGIN_VERSION_NUMBER = new Semver(ANDROID_GRADLE_PLUGIN_VERSION)
 
     @PackageScope
     //visible for testing
@@ -82,17 +85,10 @@ class PitestPlugin implements Plugin<Project> {
 
     private Project project
     private PitestPluginExtension pitestExtension
+    private Task globalTask
 
     static String sanitizeSdkVersion(String version) {
         return version.replaceAll('[^\\p{Alnum}.-]', '-')
-    }
-
-    static JavaCompile getJavaCompileTask(BaseVariant variant) {
-        if (ANDROID_GRADLE_PLUGIN_VERSION_NUMBER >= new Semver("3.3.0")) {
-            return variant.javaCompileProvider.get()
-        } else {
-            return variant.javaCompile
-        }
     }
 
     void apply(Project project) {
@@ -116,21 +112,67 @@ class PitestPlugin implements Plugin<Project> {
             }
         }
 
+        // Register the global aggregator task at apply-time. Per-variant tasks attach to it
+        // as the onVariants callback fires.
+        globalTask = project.tasks.create(PITEST_TASK_NAME)
+        globalTask.with {
+            description = "Run PIT analysis for java classes, for all build variants"
+            group = PITEST_TASK_GROUP
+            shouldRunAfter("test")
+        }
+
+        // AGP 9.x: register variant callbacks at plugin-apply time. `onVariants` is lazy
+        // and fires once AGP has determined the variant list — must NOT be inside afterEvaluate.
+        registerVariantCallbacks()
+
+        // afterEvaluate retains only the source-sets default-init and pit-dep wiring,
+        // both of which read DSL state that's stable only after evaluation.
         project.afterEvaluate {
+            CommonExtension commonExt = project.extensions.getByName('android') as CommonExtension
             if (pitestExtension.mainSourceSets.empty()) {
-                pitestExtension.mainSourceSets.set(project.android.sourceSets.main as Set<AndroidSourceSet>)
+                pitestExtension.mainSourceSets.set(commonExt.sourceSets.findByName('main') as Set<AndroidSourceSet>)
             }
             if (pitestExtension.testSourceSets.empty()) {
-                pitestExtension.testSourceSets.set(project.android.sourceSets.test as Set<AndroidSourceSet>)
+                pitestExtension.testSourceSets.set(commonExt.sourceSets.findByName('test') as Set<AndroidSourceSet>)
             }
-
-            project.plugins.withType(AppPlugin) { createPitestTasks(project.android.applicationVariants) }
-            project.plugins.withType(LibraryPlugin) { createPitestTasks(project.android.libraryVariants) }
-            project.plugins.withType(DynamicFeaturePlugin) { createPitestTasks(project.android.applicationVariants) }
-            project.plugins.withType(TestPlugin) { createPitestTasks(project.android.testVariants) }
             addPitDependencies()
         }
         addJUnitPlatformLauncherDependencyIfNeeded()
+    }
+
+    private void registerVariantCallbacks() {
+        // ApplicationAndroidComponentsExtension covers both com.android.application and com.android.dynamic-feature
+        // (DynamicFeatureAndroidComponentsExtension extends it). The selector().all() picks every variant.
+        ApplicationAndroidComponentsExtension appComponents =
+                project.extensions.findByType(ApplicationAndroidComponentsExtension)
+        if (appComponents != null) {
+            appComponents.onVariants(appComponents.selector().all()) { Variant variant ->
+                createPitestTaskForVariant(variant)
+            }
+        }
+        LibraryAndroidComponentsExtension libComponents =
+                project.extensions.findByType(LibraryAndroidComponentsExtension)
+        if (libComponents != null) {
+            libComponents.onVariants(libComponents.selector().all()) { Variant variant ->
+                createPitestTaskForVariant(variant)
+            }
+        }
+        DynamicFeatureAndroidComponentsExtension dfComponents =
+                project.extensions.findByType(DynamicFeatureAndroidComponentsExtension)
+        if (dfComponents != null && appComponents == null) {
+            // Only register if appComponents didn't already pick up dynamic features
+            // (it shouldn't, but guard against double-registration)
+            dfComponents.onVariants(dfComponents.selector().all()) { Variant variant ->
+                createPitestTaskForVariant(variant)
+            }
+        }
+        TestAndroidComponentsExtension testComponents =
+                project.extensions.findByType(TestAndroidComponentsExtension)
+        if (testComponents != null) {
+            testComponents.onVariants(testComponents.selector().all()) { Variant variant ->
+                createPitestTaskForVariant(variant)
+            }
+        }
     }
 
     private void failWithMeaningfulErrorMessageOnUnsupportedConfigurationInRootProjectBuildScript() {
@@ -142,49 +184,49 @@ class PitestPlugin implements Plugin<Project> {
     }
 
     @SuppressWarnings("BuilderMethodWithSideEffects")
-    private void createPitestTasks(DefaultDomainObjectSet<? extends BaseVariant> variants) {
-        Task globalTask = project.tasks.create(PITEST_TASK_NAME)
-        globalTask.with {
-            description = "Run PIT analysis for java classes, for all build variants"
+    private void createPitestTaskForVariant(Variant variant) {
+        if (isBaselineProfileVariant(variant)) {
+            return
+        }
+        PitestTask variantTask = project.tasks.create("${PITEST_TASK_NAME}${variant.name.capitalize()}", PitestTask)
+
+        boolean includeMockableAndroidJar = !pitestExtension.excludeMockableAndroidJar.getOrElse(false)
+        if (includeMockableAndroidJar) {
+            addMockableAndroidJarDependencies()
+        }
+
+        // AGP-9-only: mockable jar always created via PitestMockableAndroidJarTask
+        // (the AGP 3.2- legacy `mockableAndroidJar` task path is gone).
+        AndroidComponentsExtension androidComponents = project.extensions.getByType(AndroidComponentsExtension)
+        CommonExtension commonExt = project.extensions.getByName('android') as CommonExtension
+
+        PitestMockableAndroidJarTask mockableAndroidJarTask =
+                project.tasks.maybeCreate("pitestMockableAndroidJar", PitestMockableAndroidJarTask)
+        mockableAndroidJarTask.with {
+            sdkDirectory.set(androidComponents.sdkComponents.sdkDirectory)
+            compileSdkVersion.set(commonExt.compileSdk?.toString() ?: "")
+            returnDefaultValues.set(commonExt.testOptions.unitTests.isReturnDefaultValues())
+        }
+
+        configureTaskDefault(variantTask, variant, mockableAndroidJarTask.outputJar)
+
+        if (includeMockableAndroidJar) {
+            variantTask.dependsOn mockableAndroidJarTask
+        }
+
+        variantTask.with {
+            description = "Run PIT analysis for java classes, for ${variant.name} build variant"
             group = PITEST_TASK_GROUP
-            shouldRunAfter("test")
+            shouldRunAfter("test${variant.name.capitalize()}UnitTest")
         }
+        suppressPassingDeprecatedTestPluginForNewerPitVersions(variantTask)
 
-        variants.all { BaseVariant variant ->
-            PitestTask variantTask = project.tasks.create("${PITEST_TASK_NAME}${variant.name.capitalize()}", PitestTask)
-
-            boolean includeMockableAndroidJar = !pitestExtension.excludeMockableAndroidJar.getOrElse(false)
-            if (includeMockableAndroidJar) {
-                addMockableAndroidJarDependencies()
-            }
-
-            Task mockableAndroidJarTask
-            if (ANDROID_GRADLE_PLUGIN_VERSION_NUMBER < new Semver("3.2.0")) {
-                mockableAndroidJarTask = project.tasks.findByName("mockableAndroidJar")
-                configureTaskDefault(variantTask, variant, getMockableAndroidJar(project.android))
-            } else {
-                mockableAndroidJarTask = project.tasks.maybeCreate("pitestMockableAndroidJar", PitestMockableAndroidJarTask)
-                configureTaskDefault(variantTask, variant, mockableAndroidJarTask.outputJar)
-            }
-
-            if (includeMockableAndroidJar) {
-                variantTask.dependsOn mockableAndroidJarTask
-            }
-
-            variantTask.with {
-                description = "Run PIT analysis for java classes, for ${variant.name} build variant"
-                group = PITEST_TASK_GROUP
-                shouldRunAfter("test${variant.name.capitalize()}UnitTest")
-            }
-            suppressPassingDeprecatedTestPluginForNewerPitVersions(variantTask)
-
-            variantTask.dependsOn "compile${variant.name.capitalize()}UnitTestSources"
-            Task debugJavaCompileTask = project.tasks.findByName("compileDebugJavaWithJavac")
-            if (debugJavaCompileTask != null) {
-                variantTask.mustRunAfter(debugJavaCompileTask)
-            }
-            globalTask.dependsOn variantTask
+        variantTask.dependsOn "compile${variant.name.capitalize()}UnitTestSources"
+        Task debugJavaCompileTask = project.tasks.findByName("compileDebugJavaWithJavac")
+        if (debugJavaCompileTask != null) {
+            variantTask.mustRunAfter(debugJavaCompileTask)
         }
+        globalTask.dependsOn variantTask
     }
 
     private void addMockableAndroidJarDependencies() {
@@ -213,10 +255,7 @@ class PitestPlugin implements Plugin<Project> {
     }
 
     @SuppressWarnings(["Instanceof", "UnnecessarySetter", "DuplicateNumberLiteral"])
-    private void configureTaskDefault(PitestTask task, BaseVariant variant, File mockableAndroidJar) {
-        if (isBaselineProfileVariant(variant)) {
-            return
-        }
+    private void configureTaskDefault(PitestTask task, Variant variant, File mockableAndroidJar) {
         FileCollection combinedTaskClasspath = project.files()
 
         combinedTaskClasspath.with {
@@ -225,34 +264,21 @@ class PitestPlugin implements Plugin<Project> {
                 from(mockableAndroidJar)
             }
 
-            if (ANDROID_GRADLE_PLUGIN_VERSION_NUMBER.major == 3 && project.findProperty("android.enableJetifier") != "true") {
-                if (ANDROID_GRADLE_PLUGIN_VERSION_NUMBER.minor < 3) {
-                    from(project.configurations["${variant.name}CompileClasspath"].copyRecursive { dependency ->
-                        dependency.properties.dependencyProject == null
-                    })
-                    from(project.configurations["${variant.name}UnitTestCompileClasspath"].copyRecursive { dependency ->
-                        dependency.properties.dependencyProject == null
-                    })
-                } else if (ANDROID_GRADLE_PLUGIN_VERSION_NUMBER.minor < 4) {
-                    from(project.configurations["${variant.name}CompileClasspath"])
-                    from(project.configurations["${variant.name}UnitTestCompileClasspath"])
+            // AGP-9-only: runtime classpath via runtimeClasspath configurations. The AGP 3.x/4.x
+            // legacy branches were removed because the fork is AGP-9-only.
+            Configuration runtimeConfig = project.configurations.getByName("${variant.name}RuntimeClasspath")
+            Configuration copiedRuntimeConfig = runtimeConfig.copyRecursive { dependency ->
+                dependency.properties.dependencyProject == null && dependency.version != null
+            }.shouldResolveConsistentlyWith(runtimeConfig)
+
+            from(copiedRuntimeConfig.incoming.artifactView { view ->
+                view.attributes { attrs ->
+                    attrs.attribute(Attribute.of("artifactType", String), "jar")
                 }
-            } else if (ANDROID_GRADLE_PLUGIN_VERSION_NUMBER.major == 4) {
-                from(project.configurations["compile"])
-                from(project.configurations["testCompile"])
-            } else if (ANDROID_GRADLE_PLUGIN_VERSION_NUMBER.major > 4 && project.findProperty("android.enableJetifier") != "true") {
-                Configuration runtimeConfig = project.configurations.getByName("${variant.name}RuntimeClasspath")
-                Configuration copiedRuntimeConfig = runtimeConfig.copyRecursive { dependency ->
-                    dependency.properties.dependencyProject == null && dependency.version != null
-                }.shouldResolveConsistentlyWith(runtimeConfig)
+            }.files)
 
-                from(copiedRuntimeConfig.incoming.artifactView { view ->
-                    view.attributes { attrs ->
-                        attrs.attribute(Attribute.of("artifactType", String), "jar")
-                    }
-                }.files)
-
-                Configuration unittestRuntimeConfig = project.configurations.getByName("${variant.name}UnitTestRuntimeClasspath")
+            Configuration unittestRuntimeConfig = project.configurations.findByName("${variant.name}UnitTestRuntimeClasspath")
+            if (unittestRuntimeConfig != null) {
                 Configuration copiedUnittestRuntimeConfig = unittestRuntimeConfig.copyRecursive { dependency ->
                     dependency.properties.dependencyProject == null && dependency.version != null
                 }.shouldResolveConsistentlyWith(unittestRuntimeConfig)
@@ -263,6 +289,7 @@ class PitestPlugin implements Plugin<Project> {
                     }
                 }.files)
             }
+
             from(project.configurations["pitestRuntimeOnly"])
             from(project.files("${project.buildDir}/intermediates/sourceFolderJavaResources/${variant.dirName}"))
             from(project.files("${project.buildDir}/intermediates/sourceFolderJavaResources/test/${variant.dirName}"))
@@ -274,18 +301,19 @@ class PitestPlugin implements Plugin<Project> {
                 from(kotlinCompileTask.destinationDirectory.asFile)
             }
 
-            if (variant instanceof TestedVariant) {
-                variant.unitTestVariant?.with { unitTestVariant ->
+            if (variant instanceof HasUnitTest) {
+                def unitTestVariant = ((HasUnitTest) variant).unitTest
+                if (unitTestVariant != null) {
                     Task testKotlinCompileTask = project.tasks.findByName("compile${unitTestVariant.name.capitalize()}Kotlin")
                     if (testKotlinCompileTask != null) {
                         from(testKotlinCompileTask.destinationDirectory.asFile)
                     }
-                    from(getJavaCompileClasspathProvider(unitTestVariant))
-                    from(getJavaCompileDestinationProvider(unitTestVariant))
+                    from(getJavaCompileClasspathProvider(unitTestVariant.name))
+                    from(getJavaCompileDestinationProvider(unitTestVariant.name))
                 }
             }
-            from(getJavaCompileClasspathProvider(variant))
-            from(getJavaCompileDestinationProvider(variant))
+            from(getJavaCompileClasspathProvider(variant.name))
+            from(getJavaCompileDestinationProvider(variant.name))
         }
 
         task.with {
@@ -350,7 +378,10 @@ class PitestPlugin implements Plugin<Project> {
             additionalClasspathFile.set(new File(project.buildDir, PIT_ADDITIONAL_CLASSPATH_DEFAULT_FILE_NAME))
             mutableCodePaths.setFrom({
                 Object additionalMutableCodePaths = pitestExtension.additionalMutableCodePaths ?: [] as Set
-                additionalMutableCodePaths.add(getJavaCompileTask(variant).destinationDirectory.asFile)
+                Provider<Directory> javaDestProvider = getJavaCompileDestinationProvider(variant.name)
+                if (javaDestProvider.isPresent()) {
+                    additionalMutableCodePaths.add(javaDestProvider.get().asFile)
+                }
                 Task kotlinCompileTask = project.tasks.findByName("compile${variant.name.capitalize()}Kotlin")
                 if (kotlinCompileTask != null) {
                     additionalMutableCodePaths.add(kotlinCompileTask.destinationDirectory.asFile)
@@ -379,22 +410,34 @@ class PitestPlugin implements Plugin<Project> {
         }
     }
 
-    private boolean isBaselineProfileVariant(BaseVariant variant) {
+    private boolean isBaselineProfileVariant(Variant variant) {
         String flavoredNonMinified = variant.flavorName ? "${variant.flavorName}NonMinified" : "nonMinified"
         String flavoredBenchmark = variant.flavorName ? "${variant.flavorName}Benchmark" : "benchmark"
         return (project.plugins.hasPlugin("androidx.baselineprofile") && (variant.name.startsWith(flavoredNonMinified) || variant.name.startsWith(flavoredBenchmark)))
     }
 
-    private Provider<FileCollection> getJavaCompileClasspathProvider(BaseVariant variant) {
-        return project.provider {
-            getJavaCompileTask(variant).classpath
+    private TaskProvider<JavaCompile> getJavaCompileTaskProvider(String variantName) {
+        String taskName = "compile${variantName.capitalize()}JavaWithJavac"
+        if (project.tasks.findByName(taskName) == null) {
+            return null
         }
+        return project.tasks.named(taskName, JavaCompile)
     }
 
-    private Provider<Directory> getJavaCompileDestinationProvider(BaseVariant variant) {
-        return project.provider {
-            getJavaCompileTask(variant).destinationDirectory.get()
+    private Provider<FileCollection> getJavaCompileClasspathProvider(String variantName) {
+        TaskProvider<JavaCompile> provider = getJavaCompileTaskProvider(variantName)
+        if (provider == null) {
+            return project.provider { project.files() }
         }
+        return provider.map { JavaCompile task -> task.classpath }
+    }
+
+    private Provider<Directory> getJavaCompileDestinationProvider(String variantName) {
+        TaskProvider<JavaCompile> provider = getJavaCompileTaskProvider(variantName)
+        if (provider == null) {
+            return project.objects.directoryProperty()
+        }
+        return provider.flatMap { JavaCompile task -> task.destinationDirectory }
     }
 
     private void addPitDependencies() {
@@ -412,28 +455,6 @@ class PitestPlugin implements Plugin<Project> {
                 pitest project.dependencies.create(junit5PluginDependencyAsString)
             }
         }
-    }
-
-    @SuppressWarnings("DuplicateNumberLiteral")
-    private File getMockableAndroidJar(BaseExtension android) {
-        boolean returnDefaultValues = android.testOptions.unitTests.returnDefaultValues
-
-        String mockableAndroidJarFilename = "mockable-"
-        mockableAndroidJarFilename += sanitizeSdkVersion(android.compileSdkVersion)
-        if (returnDefaultValues) {
-            mockableAndroidJarFilename += '.default-values'
-        }
-
-        File mockableJarDirectory
-        if (ANDROID_GRADLE_PLUGIN_VERSION_NUMBER.major >= 3) {
-            mockableAndroidJarFilename += '.v3'
-            mockableJarDirectory = new File(project.buildDir, AndroidProject.FD_GENERATED)
-        } else {
-            mockableJarDirectory = new File(project.rootProject.buildDir, AndroidProject.FD_GENERATED)
-        }
-        mockableAndroidJarFilename += '.jar'
-
-        return new File(mockableJarDirectory, mockableAndroidJarFilename)
     }
 
     private void suppressPassingDeprecatedTestPluginForNewerPitVersions(PitestTask pitestTask) {

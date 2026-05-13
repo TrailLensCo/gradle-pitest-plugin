@@ -3,15 +3,19 @@ plugins {
     id 'groovy'
     id 'maven-publish'
     id 'codenarc'
-    id 'signing'
     id 'java-gradle-plugin'
-    id 'com.gradle.plugin-publish' version '1.2.1'
-    id 'com.vanniktech.maven.publish' version '0.25.3'
+}
+
+// TrailLens fork: removed `signing`, `com.gradle.plugin-publish`, and `com.vanniktech.maven.publish`.
+// The fork publishes only to GitHub Packages (configured at the bottom of this file); it does not
+// publish to the Gradle Plugin Portal or Maven Central. Disable any leftover Sign tasks defensively.
+tasks.withType(org.gradle.plugins.signing.Sign).configureEach { task ->
+    task.onlyIf { false }
 }
 
 java {
     toolchain {
-        languageVersion = JavaLanguageVersion.of(17)
+        languageVersion = JavaLanguageVersion.of(21)
     }
 }
 
@@ -34,7 +38,7 @@ configurations {
 dependencies {
     implementation localGroovy()
     compileOnly "org.pitest:pitest-aggregator:$pitestAggregatorVersion"
-    implementation 'com.android.tools.build:gradle:8.5.1'
+    implementation 'com.android.tools.build:gradle:9.1.0'
     implementation 'com.vdurmont:semver4j:3.1.0'
 
     testImplementation('org.spockframework:spock-core:2.4-M6-groovy-3.0') {
@@ -46,7 +50,7 @@ dependencies {
     funcTestImplementation sourceSets.main.output  //to make production plugin classes visible in functional tests (it's not in testCompile configuration)
     funcTestImplementation sourceSets.test.output
     funcTestImplementation 'com.vdurmont:semver4j:3.1.0'
-    funcTestImplementation 'com.android.tools.build:gradle:8.5.1'
+    funcTestImplementation 'com.android.tools.build:gradle:9.1.0'
     funcTestImplementation('com.netflix.nebula:nebula-test:10.6.2') {
         exclude group: 'org.codehaus.groovy', module: 'groovy-all'
     }
@@ -65,7 +69,8 @@ tasks.register('funcTest', Test) {
 funcTest.shouldRunAfter test
 check.shouldRunAfter funcTest
 check.dependsOn funcTestClasses     //or more generically: tasks.withType(AbstractCompile)
-publishPlugins.dependsOn funcTest, check
+// publishPlugins comes from com.gradle.plugin-publish — disabled for the fork.
+// Plugin Portal publishing is not used; TrailLens fork ships only to GitHub Packages.
 
 tasks.register('testReport', TestReport) {
     destinationDir = file("$buildDir/reports/allTests")
@@ -134,6 +139,22 @@ gradlePlugin {
             implementationClass = 'pl.droidsonroids.gradle.pitest.PitestAggregatorPlugin'
             displayName = 'Android Gradle pitest aggregator plugin'
             description = POM_DESCRIPTION
+        }
+    }
+}
+
+// TrailLens GitHub Packages publishing target (AGP-9-only fork).
+// Credentials are sourced from gradle properties (githubPackagesUser/githubPackagesToken)
+// or env vars (GITHUB_ACTOR/GITHUB_TOKEN for same-repo CI; PAT with read:packages for cross-repo).
+publishing {
+    repositories {
+        maven {
+            name = "GitHubPackages"
+            url = uri("https://maven.pkg.github.com/TrailLensCo/gradle-pitest-plugin")
+            credentials {
+                username = providers.gradleProperty("githubPackagesUser").getOrNull() ?: System.getenv("GITHUB_ACTOR")
+                password = providers.gradleProperty("githubPackagesToken").getOrNull() ?: System.getenv("GITHUB_TOKEN")
+            }
         }
     }
 }

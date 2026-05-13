@@ -22,7 +22,7 @@ class BaselineProfileFunctionalSpec extends AbstractPitestFunctionalSpec {
                         mavenCentral()
                     }
                     dependencies {
-                        classpath 'com.android.tools.build:gradle:8.5.1'
+                        classpath 'com.android.tools.build:gradle:9.1.0'
                         classpath 'androidx.baselineprofile:androidx.baselineprofile.gradle.plugin:1.4.1'
                     }
                 }
@@ -80,7 +80,7 @@ class BaselineProfileFunctionalSpec extends AbstractPitestFunctionalSpec {
                         mavenCentral()
                     }
                     dependencies {
-                        classpath 'com.android.tools.build:gradle:8.5.1'
+                        classpath 'com.android.tools.build:gradle:9.1.0'
                         classpath 'androidx.baselineprofile:androidx.baselineprofile.gradle.plugin:1.4.1'
                     }
                 }
