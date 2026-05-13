@@ -204,7 +204,13 @@ class PitestPlugin implements Plugin<Project> {
                 project.tasks.maybeCreate("pitestMockableAndroidJar", PitestMockableAndroidJarTask)
         mockableAndroidJarTask.with {
             sdkDirectory.set(androidComponents.sdkComponents.sdkDirectory)
-            compileSdkVersion.set(commonExt.compileSdk?.toString() ?: "")
+            // AGP 9.x: CommonExtension.compileSdk is Int (the API level). The SDK install puts
+            // android.jar under platforms/android-<level>/, so we must prepend "android-".
+            // Preview SDKs use CommonExtension.compileSdkPreview (String like "TIRAMISU").
+            String resolvedCompileSdk = commonExt.compileSdkPreview != null
+                    ? "android-${commonExt.compileSdkPreview}"
+                    : (commonExt.compileSdk != null ? "android-${commonExt.compileSdk}" : "")
+            compileSdkVersion.set(resolvedCompileSdk)
             returnDefaultValues.set(commonExt.testOptions.unitTests.isReturnDefaultValues())
         }
 
@@ -296,17 +302,21 @@ class PitestPlugin implements Plugin<Project> {
             from(project.files("${project.buildDir}/intermediates/java_res/${variant.dirName}/out"))
             from(project.files("${project.buildDir}/intermediates/java_res/${variant.dirName}UnitTest/out"))
             from(project.files("${project.buildDir}/intermediates/unitTestConfig/test/${variant.dirName}"))
-            Task kotlinCompileTask = project.tasks.findByName("compile${variant.name.capitalize()}Kotlin")
-            if (kotlinCompileTask != null) {
-                from(kotlinCompileTask.destinationDirectory.asFile)
+            // AGP 9.x built-in Kotlin compiler emits classes under
+            // build/intermediates/built_in_kotlinc/{variant}/compile{Variant}Kotlin/classes/.
+            // The KGP-style `destinationDirectory` on `compileDebugKotlin` does NOT contain the
+            // class files in AGP 9 — it points at a metadata-only directory.
+            File kotlinClassesDir = getKotlinClassesDir(variant.name)
+            if (kotlinClassesDir != null) {
+                from(kotlinClassesDir)
             }
 
             if (variant instanceof HasUnitTest) {
                 def unitTestVariant = ((HasUnitTest) variant).unitTest
                 if (unitTestVariant != null) {
-                    Task testKotlinCompileTask = project.tasks.findByName("compile${unitTestVariant.name.capitalize()}Kotlin")
-                    if (testKotlinCompileTask != null) {
-                        from(testKotlinCompileTask.destinationDirectory.asFile)
+                    File unitTestKotlinClassesDir = getKotlinClassesDir(unitTestVariant.name)
+                    if (unitTestKotlinClassesDir != null) {
+                        from(unitTestKotlinClassesDir)
                     }
                     from(getJavaCompileClasspathProvider(unitTestVariant.name))
                     from(getJavaCompileDestinationProvider(unitTestVariant.name))
@@ -357,9 +367,20 @@ class PitestPlugin implements Plugin<Project> {
             excludedGroups.set(pitestExtension.excludedGroups)
             fullMutationMatrix.set(pitestExtension.fullMutationMatrix)
             includedTestMethods.set(pitestExtension.includedTestMethods)
-            Set javaSourceSet = pitestExtension.mainSourceSets.get()*.java.srcDirs.flatten() as Set
-            Set resourcesSourceSet = pitestExtension.mainSourceSets.get()*.resources.srcDirs.flatten() as Set
-            sourceDirs.setFrom(javaSourceSet + resourcesSourceSet)
+            // AGP-9-only: source-sets default-init runs in afterEvaluate, AFTER onVariants fires.
+            // Defer reading mainSourceSets to a Callable so the value is resolved at task-graph
+            // resolution time, not at configuration time.
+            //
+            // Includes Kotlin srcDirs in addition to Java/resources — Kotlin-first Android
+            // libraries keep code under src/main/kotlin/ which is NOT part of AndroidSourceSet.java.
+            sourceDirs.setFrom({
+                Set javaSourceSet = pitestExtension.mainSourceSets.get()*.java.srcDirs.flatten() as Set
+                Set kotlinSourceSet = pitestExtension.mainSourceSets.get().collect { srcSet ->
+                    srcSet.hasProperty('kotlin') ? srcSet.kotlin.srcDirs : []
+                }.flatten() as Set
+                Set resourcesSourceSet = pitestExtension.mainSourceSets.get()*.resources.srcDirs.flatten() as Set
+                return javaSourceSet + kotlinSourceSet + resourcesSourceSet
+            } as Callable<Set<File>>)
             detectInlinedCode.set(pitestExtension.detectInlinedCode)
             timestampedReports.set(pitestExtension.timestampedReports)
             additionalClasspath.setFrom({
@@ -373,18 +394,27 @@ class PitestPlugin implements Plugin<Project> {
                 }
 
                 return filteredCombinedTaskClasspath
-            } as Callable<FileCollection>, pitestExtension.testSourceSets.get()*.java.srcDirs.flatten(), pitestExtension.testSourceSets.get()*.resources.srcDirs.flatten())
+            } as Callable<FileCollection>,
+            { pitestExtension.testSourceSets.get()*.java.srcDirs.flatten() } as Callable<Set<File>>,
+            {
+                pitestExtension.testSourceSets.get().collect { srcSet ->
+                    srcSet.hasProperty('kotlin') ? srcSet.kotlin.srcDirs : []
+                }.flatten()
+            } as Callable<Set<File>>,
+            { pitestExtension.testSourceSets.get()*.resources.srcDirs.flatten() } as Callable<Set<File>>)
             useAdditionalClasspathFile.set(pitestExtension.useClasspathFile)
             additionalClasspathFile.set(new File(project.buildDir, PIT_ADDITIONAL_CLASSPATH_DEFAULT_FILE_NAME))
             mutableCodePaths.setFrom({
                 Object additionalMutableCodePaths = pitestExtension.additionalMutableCodePaths ?: [] as Set
-                Provider<Directory> javaDestProvider = getJavaCompileDestinationProvider(variant.name)
-                if (javaDestProvider.isPresent()) {
-                    additionalMutableCodePaths.add(javaDestProvider.get().asFile)
+                File javaDestFile = getJavaCompileDestinationFile(variant.name)
+                if (javaDestFile != null) {
+                    additionalMutableCodePaths.add(javaDestFile)
                 }
-                Task kotlinCompileTask = project.tasks.findByName("compile${variant.name.capitalize()}Kotlin")
-                if (kotlinCompileTask != null) {
-                    additionalMutableCodePaths.add(kotlinCompileTask.destinationDirectory.asFile)
+                // Add unconditionally — by task-execution time, the Kotlin compile task has run.
+                // If the directory doesn't exist at PIT scan time, PIT skips it.
+                File kotlinClassesDir = getKotlinClassesDir(variant.name)
+                if (kotlinClassesDir != null) {
+                    additionalMutableCodePaths.add(kotlinClassesDir)
                 }
                 additionalMutableCodePaths
             } as Callable<Set<File>>)
@@ -424,20 +454,56 @@ class PitestPlugin implements Plugin<Project> {
         return project.tasks.named(taskName, JavaCompile)
     }
 
+    /**
+     * Returns a Provider<FileCollection> representing the variant's Java compile classpath.
+     * Returns an empty file collection (not a no-value Provider) if the Java compile task
+     * doesn't exist — avoids MissingValueException when wired into ConfigurableFileCollection.from().
+     */
     private Provider<FileCollection> getJavaCompileClasspathProvider(String variantName) {
         TaskProvider<JavaCompile> provider = getJavaCompileTaskProvider(variantName)
         if (provider == null) {
-            return project.provider { project.files() }
+            return project.provider { project.files() as FileCollection }
         }
-        return provider.map { JavaCompile task -> task.classpath }
+        return provider.map { JavaCompile task -> task.classpath as FileCollection }
     }
 
-    private Provider<Directory> getJavaCompileDestinationProvider(String variantName) {
+    /**
+     * Returns a Provider<FileCollection> wrapping the variant's Java compile destination directory.
+     * Returns an empty file collection (not a no-value Provider) if the Java compile task
+     * doesn't exist — same MissingValueException protection as getJavaCompileClasspathProvider.
+     */
+    private Provider<FileCollection> getJavaCompileDestinationProvider(String variantName) {
         TaskProvider<JavaCompile> provider = getJavaCompileTaskProvider(variantName)
         if (provider == null) {
-            return project.objects.directoryProperty()
+            return project.provider { project.files() as FileCollection }
         }
-        return provider.flatMap { JavaCompile task -> task.destinationDirectory }
+        return provider.map { JavaCompile task -> project.files(task.destinationDirectory) as FileCollection }
+    }
+
+    /**
+     * Helper for `mutableCodePaths` — returns the Java compile destination as a File, or null
+     * if the Java compile task doesn't exist for this variant.
+     */
+    private File getJavaCompileDestinationFile(String variantName) {
+        TaskProvider<JavaCompile> provider = getJavaCompileTaskProvider(variantName)
+        if (provider == null) {
+            return null
+        }
+        return provider.get().destinationDirectory.get().asFile
+    }
+
+    /**
+     * Returns the AGP 9.x built-in Kotlin compiler's class-output directory for a variant.
+     * Path pattern: build/intermediates/built_in_kotlinc/{variantName}/compile{Variant}Kotlin/classes/
+     *
+     * The path is deterministic and constructed unconditionally; the AGP built-in Kotlin compile
+     * task is registered AFTER our onVariants callback fires, so we can't probe `findByName` here.
+     * When the path is later wired into a FileCollection, Gradle resolves it lazily — empty
+     * directories are simply ignored.
+     */
+    private File getKotlinClassesDir(String variantName) {
+        String taskName = "compile${variantName.capitalize()}Kotlin"
+        return new File(project.buildDir, "intermediates/built_in_kotlinc/${variantName}/${taskName}/classes")
     }
 
     private void addPitDependencies() {
